@@ -61,3 +61,17 @@ Ce document consigne tous les choix structurants réalisés lors de la conceptio
 ### Décision 8 : Fuseau horaire de référence « Africa/Kinshasa » (UTC+1)
 - **Constat :** Le décalage horaire avec les serveurs internationaux peut faire passer un paiement enregistré à 23h30 au jour suivant.
 - **Choix retenu :** Toutes les dates, heures de saisie et écritures d'audit sont verrouillées sur le fuseau officiel de la capitale congolaise `Africa/Kinshasa`.
+
+---
+
+### Décision 9 : Connexion par e-mail et mot de passe via Supabase Auth
+- **Constat :** Les profils de démonstration stockés dans le navigateur ne vérifient pas l’identité et ne conviennent pas aux données réelles des écoles.
+- **Choix retenu :** L’authentification réelle passe par Supabase Auth. L’inscription crée le profil, l’école, le rôle directeur et l’année scolaire en une seule transaction côté base de données.
+- **Bénéfice :** Les mots de passe ne sont pas gérés par l’application et les accès aux données sont contrôlés par les politiques RLS.
+
+---
+
+### Décision 10 : La démo reste distincte des comptes réels
+- **Constat :** Les écrans de démonstration utilisent encore un stockage local et ne sont pas reliés aux tables Supabase.
+- **Choix retenu :** Conserver la démo pour essayer l’interface, mais signaler clairement qu’elle n’est pas un espace sécurisé et ne doit pas recevoir de données réelles.
+- **Bénéfice :** Les fonctions existantes restent essayables sans confondre un profil fictif avec un compte d’école.

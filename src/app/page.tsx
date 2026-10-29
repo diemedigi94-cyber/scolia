@@ -62,6 +62,9 @@ export default function HomePage() {
           <Link className="transition hover:text-blue-700" href="/dashboard">
             Voir la démo
           </Link>
+          <Link className="transition hover:text-blue-700" href="/login">
+            Connexion
+          </Link>
         </nav>
 
         <a
@@ -110,6 +113,16 @@ export default function HomePage() {
               <ArrowRight aria-hidden="true" className="h-4 w-4" />
             </Link>
           </div>
+          <p className="mt-4 text-sm text-slate-500">
+            Déjà un compte ?{' '}
+            <Link className="font-bold text-blue-700 hover:text-blue-900" href="/login">
+              Se connecter
+            </Link>
+            <span className="mx-2">·</span>
+            <Link className="font-bold text-blue-700 hover:text-blue-900" href="/register">
+              Créer mon école
+            </Link>
+          </p>
 
           <div className="mt-8 flex flex-wrap gap-x-6 gap-y-3 text-sm font-medium text-slate-600">
             <span className="inline-flex items-center gap-2">

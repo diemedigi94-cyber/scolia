@@ -1,6 +1,6 @@
 -- ==========================================================
 -- SCOLIA - SCHÉMA DE BASE DE DONNÉES SUPABASE (PostgreSQL)
--- Phase 1 : Multi-tenant, RLS, Sécurité et Traçabilité
+-- Phase 2 : Authentification, écoles, rôles et séparation des données
 -- Fuseau horaire de référence : Africa/Kinshasa
 -- ==========================================================
 
@@ -128,6 +128,71 @@ CREATE TABLE IF NOT EXISTS public.audit_logs (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('Africa/Kinshasa'::text, now()) NOT NULL
 );
 
+-- Créer le profil, l'école, l'adhésion directeur et l'année scolaire
+-- dans la même transaction que l'inscription Auth.
+CREATE OR REPLACE FUNCTION public.handle_new_user()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+DECLARE
+    metadata JSONB := COALESCE(NEW.raw_user_meta_data, '{}'::jsonb);
+    school_name TEXT := NULLIF(BTRIM(metadata ->> 'school_name'), '');
+    director_name TEXT := NULLIF(BTRIM(metadata ->> 'full_name'), '');
+    school_city TEXT := COALESCE(NULLIF(BTRIM(metadata ->> 'city'), ''), 'Kinshasa');
+    school_currency TEXT := COALESCE(metadata ->> 'currency_default', 'USD');
+    school_id UUID;
+    school_slug TEXT;
+    current_year INTEGER;
+BEGIN
+    IF school_name IS NULL OR director_name IS NULL THEN
+        RAISE EXCEPTION 'Le nom du directeur et le nom de l’école sont obligatoires.';
+    END IF;
+
+    IF school_currency NOT IN ('USD', 'CDF') THEN
+        RAISE EXCEPTION 'La devise doit être USD ou CDF.';
+    END IF;
+
+    INSERT INTO public.profiles (id, full_name, phone)
+    VALUES (
+        NEW.id,
+        director_name,
+        NULLIF(BTRIM(metadata ->> 'director_phone'), '')
+    );
+
+    school_slug := TRIM(BOTH '-' FROM REGEXP_REPLACE(LOWER(school_name), '[^a-z0-9]+', '-', 'g'));
+    IF school_slug = '' THEN
+        school_slug := 'ecole';
+    END IF;
+    school_slug := school_slug || '-' || SUBSTRING(NEW.id::TEXT FROM 1 FOR 8);
+
+    INSERT INTO public.schools (name, slug, city, phone, currency_default)
+    VALUES (
+        school_name,
+        school_slug,
+        school_city,
+        NULLIF(BTRIM(metadata ->> 'school_phone'), ''),
+        school_currency
+    )
+    RETURNING id INTO school_id;
+
+    INSERT INTO public.memberships (school_id, user_id, role)
+    VALUES (school_id, NEW.id, 'director');
+
+    current_year := EXTRACT(YEAR FROM (NOW() AT TIME ZONE 'Africa/Kinshasa'))::INTEGER;
+    INSERT INTO public.academic_years (school_id, name, is_current)
+    VALUES (school_id, current_year::TEXT || '-' || (current_year + 1)::TEXT, TRUE);
+
+    RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users;
+CREATE TRIGGER on_auth_user_created
+    AFTER INSERT ON auth.users
+    FOR EACH ROW EXECUTE FUNCTION public.handle_new_user();
+
 -- ==========================================================
 -- SÉCURITÉ : RÈGLES RLS (Row Level Security)
 -- ==========================================================
@@ -142,43 +207,185 @@ ALTER TABLE public.payments ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.receipts ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.audit_logs ENABLE ROW LEVEL SECURITY;
 
--- Fonction helper pour vérifier l'appartenance d'un utilisateur à une école
+-- Ces fonctions évitent la récursion des règles RLS sur memberships.
 CREATE OR REPLACE FUNCTION public.user_has_access_to_school(target_school_id UUID)
 RETURNS BOOLEAN AS $$
-BEGIN
-    RETURN EXISTS (
-        SELECT 1 FROM public.memberships
-        WHERE school_id = target_school_id
-          AND user_id = auth.uid()
+    SELECT EXISTS (
+        SELECT 1
+        FROM public.memberships AS membership
+        WHERE membership.school_id = target_school_id
+          AND membership.user_id = (SELECT auth.uid())
     );
-END;
-$$ LANGUAGE plpgsql SECURITY DEFINER;
+$$ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '';
 
--- Fonction helper pour vérifier le rôle directeur
 CREATE OR REPLACE FUNCTION public.user_is_director(target_school_id UUID)
 RETURNS BOOLEAN AS $$
-BEGIN
-    RETURN EXISTS (
-        SELECT 1 FROM public.memberships
-        WHERE school_id = target_school_id
-          AND user_id = auth.uid()
-          AND role = 'director'
+    SELECT EXISTS (
+        SELECT 1
+        FROM public.memberships AS membership
+        WHERE membership.school_id = target_school_id
+          AND membership.user_id = (SELECT auth.uid())
+          AND membership.role = 'director'
     );
-END;
-$$ LANGUAGE plpgsql SECURITY DEFINER;
+$$ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = '';
 
--- Exemples de politiques RLS :
--- L'utilisateur ne voit que les élèves de son école
-CREATE POLICY "Accès aux élèves par école"
-ON public.students FOR ALL
+REVOKE ALL ON FUNCTION public.handle_new_user() FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.user_has_access_to_school(UUID) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.user_is_director(UUID) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.user_has_access_to_school(UUID) TO authenticated;
+GRANT EXECUTE ON FUNCTION public.user_is_director(UUID) TO authenticated;
+
+-- Retirer les anciennes règles pour permettre de relancer ce fichier.
+DROP POLICY IF EXISTS "Accès aux élèves par école" ON public.students;
+DROP POLICY IF EXISTS "Accès aux paiements par école" ON public.payments;
+DROP POLICY IF EXISTS "Accès journal audit directeur" ON public.audit_logs;
+DROP POLICY IF EXISTS "Écoles visibles par leurs membres" ON public.schools;
+DROP POLICY IF EXISTS "Écoles modifiables par les directeurs" ON public.schools;
+DROP POLICY IF EXISTS "Profils visibles par leur titulaire ou leur école" ON public.profiles;
+DROP POLICY IF EXISTS "Profils modifiables par leur titulaire" ON public.profiles;
+DROP POLICY IF EXISTS "Adhésions visibles par école" ON public.memberships;
+DROP POLICY IF EXISTS "Adhésions créées par un directeur" ON public.memberships;
+DROP POLICY IF EXISTS "Adhésions modifiées par un directeur" ON public.memberships;
+DROP POLICY IF EXISTS "Années scolaires visibles par école" ON public.academic_years;
+DROP POLICY IF EXISTS "Années scolaires gérées par directeur" ON public.academic_years;
+DROP POLICY IF EXISTS "Classes visibles par école" ON public.classes;
+DROP POLICY IF EXISTS "Classes gérées par directeur" ON public.classes;
+DROP POLICY IF EXISTS "Élèves visibles par école" ON public.students;
+DROP POLICY IF EXISTS "Élèves gérés par directeur" ON public.students;
+DROP POLICY IF EXISTS "Frais visibles par école" ON public.fee_items;
+DROP POLICY IF EXISTS "Frais gérés par directeur" ON public.fee_items;
+DROP POLICY IF EXISTS "Paiements visibles par école" ON public.payments;
+DROP POLICY IF EXISTS "Paiements enregistrés par un membre" ON public.payments;
+DROP POLICY IF EXISTS "Paiements annulés par un directeur" ON public.payments;
+DROP POLICY IF EXISTS "Reçus visibles par école" ON public.receipts;
+DROP POLICY IF EXISTS "Reçus créés par un membre" ON public.receipts;
+DROP POLICY IF EXISTS "Journal visible par directeur" ON public.audit_logs;
+DROP POLICY IF EXISTS "Journal ajouté par un membre" ON public.audit_logs;
+
+CREATE POLICY "Écoles visibles par leurs membres"
+ON public.schools FOR SELECT TO authenticated
+USING (public.user_has_access_to_school(id));
+
+CREATE POLICY "Écoles modifiables par les directeurs"
+ON public.schools FOR UPDATE TO authenticated
+USING (public.user_is_director(id))
+WITH CHECK (public.user_is_director(id));
+
+CREATE POLICY "Profils visibles par leur titulaire ou leur école"
+ON public.profiles FOR SELECT TO authenticated
+USING (
+    id = (SELECT auth.uid())
+    OR EXISTS (
+        SELECT 1
+        FROM public.memberships AS own_membership
+        JOIN public.memberships AS shared_membership
+          ON shared_membership.school_id = own_membership.school_id
+        WHERE own_membership.user_id = (SELECT auth.uid())
+          AND shared_membership.user_id = profiles.id
+    )
+);
+
+CREATE POLICY "Profils modifiables par leur titulaire"
+ON public.profiles FOR UPDATE TO authenticated
+USING (id = (SELECT auth.uid()))
+WITH CHECK (id = (SELECT auth.uid()));
+
+CREATE POLICY "Adhésions visibles par école"
+ON public.memberships FOR SELECT TO authenticated
 USING (public.user_has_access_to_school(school_id));
 
--- L'utilisateur ne voit que les paiements de son école
-CREATE POLICY "Accès aux paiements par école"
-ON public.payments FOR ALL
+CREATE POLICY "Adhésions créées par un directeur"
+ON public.memberships FOR INSERT TO authenticated
+WITH CHECK (public.user_is_director(school_id));
+
+CREATE POLICY "Adhésions modifiées par un directeur"
+ON public.memberships FOR UPDATE TO authenticated
+USING (public.user_is_director(school_id))
+WITH CHECK (public.user_is_director(school_id));
+
+CREATE POLICY "Années scolaires visibles par école"
+ON public.academic_years FOR SELECT TO authenticated
 USING (public.user_has_access_to_school(school_id));
 
--- Seul le directeur peut voir les logs d'audit
-CREATE POLICY "Accès journal audit directeur"
-ON public.audit_logs FOR SELECT
+CREATE POLICY "Années scolaires gérées par directeur"
+ON public.academic_years FOR ALL TO authenticated
+USING (public.user_is_director(school_id))
+WITH CHECK (public.user_is_director(school_id));
+
+CREATE POLICY "Classes visibles par école"
+ON public.classes FOR SELECT TO authenticated
+USING (public.user_has_access_to_school(school_id));
+
+CREATE POLICY "Classes gérées par directeur"
+ON public.classes FOR ALL TO authenticated
+USING (public.user_is_director(school_id))
+WITH CHECK (public.user_is_director(school_id));
+
+CREATE POLICY "Élèves visibles par école"
+ON public.students FOR SELECT TO authenticated
+USING (public.user_has_access_to_school(school_id));
+
+CREATE POLICY "Élèves gérés par directeur"
+ON public.students FOR ALL TO authenticated
+USING (public.user_is_director(school_id))
+WITH CHECK (public.user_is_director(school_id));
+
+CREATE POLICY "Frais visibles par école"
+ON public.fee_items FOR SELECT TO authenticated
+USING (public.user_has_access_to_school(school_id));
+
+CREATE POLICY "Frais gérés par directeur"
+ON public.fee_items FOR ALL TO authenticated
+USING (public.user_is_director(school_id))
+WITH CHECK (public.user_is_director(school_id));
+
+CREATE POLICY "Paiements visibles par école"
+ON public.payments FOR SELECT TO authenticated
+USING (public.user_has_access_to_school(school_id));
+
+CREATE POLICY "Paiements enregistrés par un membre"
+ON public.payments FOR INSERT TO authenticated
+WITH CHECK (
+    public.user_has_access_to_school(school_id)
+    AND created_by = (SELECT auth.uid())
+);
+
+CREATE POLICY "Paiements annulés par un directeur"
+ON public.payments FOR UPDATE TO authenticated
+USING (public.user_is_director(school_id))
+WITH CHECK (public.user_is_director(school_id));
+
+CREATE POLICY "Reçus visibles par école"
+ON public.receipts FOR SELECT TO authenticated
+USING (public.user_has_access_to_school(school_id));
+
+CREATE POLICY "Reçus créés par un membre"
+ON public.receipts FOR INSERT TO authenticated
+WITH CHECK (public.user_has_access_to_school(school_id));
+
+CREATE POLICY "Journal visible par directeur"
+ON public.audit_logs FOR SELECT TO authenticated
 USING (public.user_is_director(school_id));
+
+CREATE POLICY "Journal ajouté par un membre"
+ON public.audit_logs FOR INSERT TO authenticated
+WITH CHECK (
+    public.user_has_access_to_school(school_id)
+    AND user_id = (SELECT auth.uid())
+);
+
+REVOKE ALL ON public.schools, public.profiles, public.memberships,
+    public.academic_years, public.classes, public.students, public.fee_items,
+    public.payments, public.receipts, public.audit_logs
+FROM anon, authenticated;
+
+GRANT SELECT, UPDATE ON public.schools TO authenticated;
+GRANT SELECT, UPDATE ON public.profiles TO authenticated;
+GRANT SELECT, INSERT, UPDATE ON public.memberships TO authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.academic_years TO authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.classes TO authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.students TO authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.fee_items TO authenticated;
+GRANT SELECT, INSERT, UPDATE ON public.payments TO authenticated;
+GRANT SELECT, INSERT ON public.receipts TO authenticated;
+GRANT SELECT, INSERT ON public.audit_logs TO authenticated;
